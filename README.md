@@ -61,11 +61,11 @@ pip install pandas numpy seaborn matplotlib scikit-learn streamlit schedule nba_
 
 2) Run MVP Prediction & Update Data
 ```python
-python mvp_prediction.py
+python nba_mvp.py
 ```
 3) Launch Streamlit Dashboard
 ```python
-streamlit run mvp_prediction.py
+streamlit run nba_mvp.py
 ```
 
 **🤝 Contributions**
