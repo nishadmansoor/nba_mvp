@@ -68,8 +68,5 @@ python nba_mvp.py
 streamlit run nba_mvp.py
 ```
 
-**🤝 Contributions**
-
-Fork this repository if you have any issues, or if you have suggestions for the project!
 
 
