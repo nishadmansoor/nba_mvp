@@ -43,13 +43,13 @@ The model is trained using historical MVP data and enriched with live player sta
 
 **📈 Model Training & Evaluation**
 
-Data Preprocessing: Missing values handled, rolling averages computed.
+Data Preprocessing: Handled missing values, and computed rolling averages. 
 
 Feature Engineering: Constructed MVP_Score based on advanced metrics.
 
-Model Used: Random Forest Regressor trained on past MVPs.
+Model Used: Random Forest Regressor and Neural Network
 
-Evaluation Metric: Mean Absolute Error (MAE) to assess prediction accuracy.
+Evaluation Metric: Mean Absolute Error (MAE) to assess prediction accuracy for both models. 
 
 **🖥️ How to run the project**
 
