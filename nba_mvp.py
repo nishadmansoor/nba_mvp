@@ -7,6 +7,9 @@ import schedule
 import time
 import threading
 import requests
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from bs4 import BeautifulSoup
 from datetime import datetime
 from nba_api.stats.endpoints import playergamelogs
@@ -136,18 +139,16 @@ def train_model(player_stats):
 
     data = player_stats.merge(previous_mvp, left_on='PLAYER_NAME', right_on='Player', how='left').fillna(0)
 
-    # Make sure MVP_Score exists and no leakage
     if 'MVP_Score_x' in data.columns:
         data.rename(columns={'MVP_Score_x': 'MVP_Score'}, inplace=True)
     elif 'MVP_Score_y' in data.columns:
         data.rename(columns={'MVP_Score_y': 'MVP_Score'}, inplace=True)
 
-    # Use only player features and team win percentage
     feature_columns = ['PTS_10G', 'REB_10G', 'AST_10G', 'WIN_PCT']
     X = data[feature_columns]
     y = data['MVP_Score']
 
-    # Train-test split to avoid overfitting
+    # Random Forest Regressor
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     scaler = StandardScaler()
@@ -159,8 +160,42 @@ def train_model(player_stats):
 
     y_pred = model.predict(X_test_scaled)
     mae = mean_absolute_error(y_test, y_pred)
-    print(f"Test MAE: {mae:.4f}")
+    print(f"Random Forest MAE: {mae:.4f}")
 
+    # Pytorch
+    X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+    Y_train_tensor = torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1)
+    Y_test_tensor = torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1)
+
+    class MVPNet(nn.Module):
+        def __init__(self, input_size):
+            super(MVPNet, self).__init__()
+            self.net = nn.Sequential(
+                nn.Linear(X_train_tensor.shape[1], 16),
+                nn.ReLU(),
+                nn.Linear(16,1)
+            )
+        def forward(self, x):
+            return self.net(x)
+        
+    model_nn = MVPNet()
+    loss_nn = nn.MSELoss()
+    optimizer = optim.Adam(model_nn.parameters(), lr=0.01)
+
+    for epoch in range(300):
+        model_nn.train()
+        optimizer.zero_grad()
+        output = model_nn(X_train_tensor)
+        loss = loss_nn(output, Y_train_tensor)
+        loss.backward()
+        optimizer.step()
+
+    model_nn.eval()
+    with torch.no_grad():
+        prediction = model_nn(X_test_tensor)
+        mae_nn = mean_absolute_error(Y_test_tensor.numpy(), prediction.numpy())
+        print(f"Pytorch MAE: {mae_nn:.4f}")
     return model, scaler, feature_columns
 
 # update the predictions
