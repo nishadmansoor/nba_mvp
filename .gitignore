@@ -1,0 +1,19 @@
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / models (do NOT commit large files)
+data/raw/
+data/processed/
+models/
+
+# Streamlit
+.streamlit/
