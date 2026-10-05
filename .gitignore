@@ -12,8 +12,12 @@ __pycache__/
 
 # Data / models (do NOT commit large files)
 data/raw/
-data/processed/
-models/
+data/processed/*
+models/*
+# ...except the small outputs the deployed Streamlit app needs
+!data/processed/leaderboard_*.csv
+!models/mvp_vote_share_model.joblib
+!models/.gitkeep
 
 # Streamlit
 .streamlit/
