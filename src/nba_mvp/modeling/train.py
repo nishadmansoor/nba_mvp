@@ -1,20 +1,25 @@
 from __future__ import annotations
 
-from pathlib import Path
+import argparse
+
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.model_selection import GroupKFold
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from nba_mvp.data.io import PROCESSED_DIR, MODELS_DIR, read_csv
+from nba_mvp.features.build_training_set import FEATURE_COLS
 
 MODEL_PATH = MODELS_DIR / "mvp_vote_share_model.joblib"
+
+# Predicting 2024-25, so the model only learns from seasons before it
+DEFAULT_TRAIN_THROUGH = "2023-24"
+
 
 def time_based_split(df: pd.DataFrame, test_seasons: int = 2):
     seasons = sorted(df["season"].unique())
@@ -22,61 +27,79 @@ def time_based_split(df: pd.DataFrame, test_seasons: int = 2):
     train = seasons[:-test_seasons]
     return df[df["season"].isin(train)].copy(), df[df["season"].isin(test)].copy()
 
-def build_pipeline(feature_cols: list[str], cat_cols: list[str]) -> Pipeline:
-    num_pipe = Pipeline(steps=[
+
+def build_regressor() -> Pipeline:
+    """Primary model: predicts each player's MVP vote share."""
+    return Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
+        ("model", HistGradientBoostingRegressor(
+            learning_rate=0.05,
+            max_depth=4,
+            max_iter=300,
+            min_samples_leaf=20,
+            random_state=42,
+        )),
     ])
-    cat_pipe = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+
+
+def build_classifier() -> Pipeline:
+    """Secondary model: is this player the season's MVP? (one positive per season)"""
+    return Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scale", StandardScaler()),
+        ("model", LogisticRegression(C=0.1, class_weight="balanced", max_iter=2000)),
     ])
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", num_pipe, feature_cols),
-            ("cat", cat_pipe, cat_cols),
-        ],
-        remainder="drop",
-    )
-    model = HistGradientBoostingRegressor(
-        learning_rate=0.05,
-        max_depth=6,
-        max_iter=600,
-        random_state=42,
-    )
-    return Pipeline(steps=[("preprocess", pre), ("model", model)])
+
+
+def fit_models(df: pd.DataFrame, feature_cols: list[str] = FEATURE_COLS) -> dict:
+    # The regressor learns from every player (the zeros help it rank vote-getters);
+    # the classifier only compares plausible candidates (see is_candidate).
+    regressor = build_regressor().fit(df[feature_cols], df["vote_share"].astype(float).values)
+    cand = df[df["is_candidate"] == 1]
+    classifier = build_classifier().fit(cand[feature_cols], cand["is_winner"].astype(int).values)
+    return {"pipeline": regressor, "classifier": classifier, "feature_cols": feature_cols}
+
+
+def predict(models: dict, df: pd.DataFrame) -> pd.DataFrame:
+    """Add pred_vote_share and pred_winner_prob (sums to 1 within each season)."""
+    out = df.copy()
+    X = out[models["feature_cols"]]
+    candidate = out["is_candidate"] == 1
+    out["pred_vote_share"] = np.where(candidate, np.clip(models["pipeline"].predict(X), 0.0, 1.0), 0.0)
+    raw = pd.Series(np.where(candidate, models["classifier"].predict_proba(X)[:, 1], 0.0), index=out.index)
+    out["pred_winner_prob"] = raw / raw.groupby(out["season"]).transform("sum")
+    return out
+
 
 def main() -> None:
+    p = argparse.ArgumentParser(description="Train MVP vote-share + winner models.")
+    p.add_argument("--train-through", default=DEFAULT_TRAIN_THROUGH,
+                   help="last season (e.g. 2023-24) the final model may learn from")
+    args = p.parse_args()
+
     df = read_csv(PROCESSED_DIR / "training_set.csv")
+    df = df[df["season"] <= args.train_through]
+    if df.empty:
+        raise ValueError(f"No training seasons on or before {args.train_through}")
 
-    target = "vote_share"
-    cat_cols = [c for c in ["team"] if c in df.columns]
-    ignore = {"season", "player", target, "season_end_year"} | set(cat_cols)
-
-    feature_cols = [c for c in df.columns if c not in ignore]
-    X = df[feature_cols + cat_cols].copy()
-    y = df[target].astype(float).values
-
+    # Holdout check: train on older seasons, score the two most recent
     train_df, test_df = time_based_split(df, test_seasons=2)
-    X_train = train_df[feature_cols + cat_cols]
-    y_train = train_df[target].astype(float).values
-    X_test = test_df[feature_cols + cat_cols]
-    y_test = test_df[target].astype(float).values
+    holdout = predict(fit_models(train_df), test_df)
+    mae = mean_absolute_error(holdout["vote_share"], holdout["pred_vote_share"])
+    rmse = root_mean_squared_error(holdout["vote_share"], holdout["pred_vote_share"])
 
-    pipe = build_pipeline(feature_cols=feature_cols, cat_cols=cat_cols)
-    pipe.fit(X_train, y_train)
-
-    preds = pipe.predict(X_test)
-    mae = mean_absolute_error(y_test, preds)
-    rmse = mean_squared_error(y_test, preds, squared=False)
+    # Final model learns from every season up to --train-through
+    models = fit_models(df)
+    models["train_through"] = args.train_through
+    models["train_seasons"] = sorted(df["season"].unique())
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump(
-        {"pipeline": pipe, "feature_cols": feature_cols, "cat_cols": cat_cols},
-        MODEL_PATH
-    )
+    joblib.dump(models, MODEL_PATH)
     print(f"Saved model -> {MODEL_PATH}")
-    print(f"Test seasons: {sorted(test_df['season'].unique())}")
-    print(f"MAE={mae:.4f} RMSE={rmse:.4f}")
+    print(f"Trained on {len(models['train_seasons'])} seasons: "
+          f"{models['train_seasons'][0]} .. {models['train_seasons'][-1]}")
+    print(f"Holdout seasons: {sorted(test_df['season'].unique())}  MAE={mae:.4f} RMSE={rmse:.4f}")
+
 
 if __name__ == "__main__":
     main()

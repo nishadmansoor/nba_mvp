@@ -1,14 +1,14 @@
 # NBA MVP Predictor
 
-Predicts NBA MVP outcomes by learning from **historical MVP voting** (vote share) and producing a **current-season leaderboard** with explanations.
+Predicts NBA MVP outcomes by learning from **historical MVP voting** (vote share) and producing a **season leaderboard** (2024-25) with explanations.
 
 This repo is structured as a reproducible pipeline:
 - **Ingest** historical MVP voting + player season stats
 - **Train** a model to predict MVP *vote share* (regression) and evaluate using ranking metrics
-- **Predict** a current-season MVP leaderboard (one row per player)
+- **Predict** a season MVP leaderboard (one row per player); defaults to 2024-25, held out of training
 - **Explore** results in a Streamlit app
 
-> If you don't want to scrape Basketball Reference, you can provide your own `data/raw/mvp_voting.csv` and `data/raw/player_season_stats.csv` (schemas below).
+> If you don't want to scrape Basketball Reference, you can provide your own files in `data/raw/` (schemas below).
 
 ---
 
@@ -17,35 +17,32 @@ This repo is structured as a reproducible pipeline:
 The Streamlit app shows:
 - Top-N MVP leaderboard (predicted vote share)
 - Player drill-down (inputs + model explanation)
-- Filters (min games played, team win%, position/role if available)
+- Filters (min games played, team win %, position)
+- Predicted vs. actual voting results, plus backtest performance
 
 ---
 
 ## Data
 
+All three raw files come from Basketball-Reference (seasons 2009-10 through 2024-25 by default; pass `--start/--end` season ending years to change the range). The scrapers are rate-limited to stay under the site's ~20 requests/minute.
+
 ### 1) Historical MVP voting (label)
-Expected file: `data/raw/mvp_voting.csv`
-
-Minimum columns:
-- `season` (e.g., `2023-24`)
-- `player`
-- `vote_share` (float in [0, 1])
-- `rank` (int; optional)
-- `team` (optional)
-
-You can generate this by running the scraper:
+`data/raw/mvp_voting.csv`: `season` (e.g. `2023-24`), `player`, `vote_share` (float in [0, 1]), `rank`, `is_winner`
 ```bash
 python -m nba_mvp.data.scrape_mvp_voting
 ```
 
 ### 2) Player season stats (features)
-Expected file: `data/raw/player_season_stats.csv`
+`data/raw/player_season_stats.csv`: one row per player-season (traded players use their season totals, with each stint in `teams`). Includes per-game stats (`g`, `mp`, `pts`, `trb`, `ast`, `stl`, `blk`, ...) and advanced stats (`ws`, `ws/48`, `bpm`, `vorp`, `ts%`, `per`, `usg%`, ...).
+```bash
+python -m nba_mvp.data.scrape_player_season_stats
+```
 
-Minimum columns:
-- `season`, `player`, `team`, `g`, `mp`, `pts`, `trb`, `ast`, `stl`, `blk`
-- advanced metrics if available: `ws`, `ws_per_48`, `bpm`, `vorp`, `ts_pct` (any subset is OK)
-
-> For a quick start, this repo includes a cleaned version of your winner-only MVP stats as `data/processed/mvp_winners_stats.csv`. It's useful for sanity checks but **not sufficient** to learn voting patterns by itself.
+### 3) Team standings (team success feature)
+`data/raw/team_standings.csv`: `season`, `team`, `w`, `l`, `win_pct`. Used to give each player a games-weighted team win %.
+```bash
+python -m nba_mvp.data.scrape_team_standings
+```
 
 ---
 
@@ -55,44 +52,56 @@ Minimum columns:
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # (Windows: .venv\Scripts\activate)
-pip install -r requirements.txt
+pip install -r requirements.txt   # also installs this package in editable mode
 ```
 
-### 1) Build training data
+### 1) Get data (skip if `data/raw/` is already populated)
+```bash
+python -m nba_mvp.data.scrape_mvp_voting
+python -m nba_mvp.data.scrape_player_season_stats
+python -m nba_mvp.data.scrape_team_standings
+```
+
+### 2) Build training data
 ```bash
 python -m nba_mvp.features.build_training_set
 ```
 
-### 2) Train + evaluate
+### 3) Train + evaluate
+The target season is **2024-25**, so the model trains on 2009-10 through 2023-24 only (`--train-through` to change).
 ```bash
 python -m nba_mvp.modeling.train
 python -m nba_mvp.modeling.evaluate
 ```
 
-### 3) Generate current leaderboard
-Option A: from an existing file (like your `latest_mvp_predictions.csv`)
+### 4) Generate the 2024-25 leaderboard
 ```bash
-python -m nba_mvp.modeling.predict_current --input data/raw/latest_mvp_predictions.csv
+python -m nba_mvp.modeling.predict_season --season 2024-25
 ```
+Writes `data/processed/leaderboard_2024-25.csv` with predicted vote share, winner probability, heuristic score, and actual voting results for comparison.
 
-### 4) Run the app
+### 5) Run the app
 ```bash
 streamlit run app/streamlit_app.py
 ```
 
 ---
 
+## Models
+
+- **Vote share model (primary):** gradient-boosted regressor on season stats, team win %, and within-season percentiles of key stats (MVP voting is relative to that year's league).
+- **Winner classifier (secondary):** logistic regression for "won MVP", normalized to sum to 100% within a season.
+- **Heuristic score (baseline):** `0.35·PTS + 0.20·AST + 0.15·REB + 0.20·WS + 0.10·BPM`, carried over from the original script.
+
 ## Evaluation
 
 This project reports metrics that match the MVP problem:
 - **Top-1 accuracy** (did we pick the winner?)
 - **Top-3 accuracy**
-- **Spearman rank correlation** between predicted and actual voting ranks
+- **Spearman rank correlation** between predicted and actual vote share (vote-getters only)
 - **MAE/RMSE** on vote share (regression)
 
-The split is **time-based by season** (no leakage):
-- Train: older seasons
-- Validate/Test: most recent seasons
+`evaluate` runs a **walk-forward backtest** (no leakage): each of the last 8 training seasons is predicted by a model trained only on the seasons before it. Results are saved to `reports/backtest.csv` and shown in the app. `train` also prints MAE/RMSE on a two-season holdout.
 
 ---
 

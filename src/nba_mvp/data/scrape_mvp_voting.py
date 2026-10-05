@@ -1,87 +1,94 @@
 from __future__ import annotations
 
-import re
-from pathlib import Path
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
+import argparse
+from io import StringIO
 
+import pandas as pd
+
+from nba_mvp.data.bbref import clean_player_names, fetch, flatten_columns, season_str, uncomment_tables
 from nba_mvp.data.io import RAW_DIR, write_csv
 
-BR_BASE = "https://www.basketball-reference.com"
+OUT_PATH = RAW_DIR / "mvp_voting.csv"
 
-def _season_url(season_end_year: int) -> str:
-    # Example: 2024 -> .../awards/awards_2024.html
-    return f"{BR_BASE}/awards/awards_{season_end_year}.html"
 
-def _parse_mvp_table(html: str, season_label: str) -> pd.DataFrame:
-    soup = BeautifulSoup(html, "lxml")
+def scrape_mvp_voting(ending_year: int) -> pd.DataFrame:
+    url = f"https://www.basketball-reference.com/awards/awards_{ending_year}.html"
+    html_raw = fetch(url)
+    html = uncomment_tables(html_raw)
 
-    # Basketball-Reference often wraps tables in comments; BeautifulSoup doesn't parse those as DOM tables.
-    # We fall back to a regex-based extraction of the table HTML if needed.
-    table = soup.find("table", {"id": "mvp"})
-    if table is None:
-        comments = soup.find_all(string=lambda t: isinstance(t, type(soup.comment)))
-        mvp_html = None
-        for c in comments:
-            if "table" in c and 'id="mvp"' in c:
-                mvp_html = c
+    # --------------------------------------------------
+    # 1) FIND THE MVP TABLE
+    # --------------------------------------------------
+    mvp = None
+    for table_id in ("mvp", "mvp_voting"):
+        try:
+            mvp = pd.read_html(StringIO(html), attrs={"id": table_id})[0]
+            break
+        except ValueError:
+            pass
+
+    if mvp is None:
+        for t in pd.read_html(StringIO(html)):
+            cols = [str(b).strip().lower() for (_, b) in t.columns] if isinstance(t.columns, pd.MultiIndex) \
+                else [str(c).strip().lower() for c in t.columns]
+            if ("share" in cols) and (("player" in cols) or ("name" in cols)):
+                mvp = t
                 break
-        if mvp_html is None:
-            raise RuntimeError("Could not find MVP table on page.")
-        table_soup = BeautifulSoup(mvp_html, "lxml")
-        table = table_soup.find("table", {"id": "mvp"})
-        if table is None:
-            raise RuntimeError("Could not parse MVP table from commented HTML.")
 
-    df = pd.read_html(str(table))[0]
+    if mvp is None:
+        debug_path = RAW_DIR / f"debug_awards_{ending_year}.html"
+        debug_path.write_text(html_raw, encoding="utf-8")
+        raise RuntimeError(
+            f"MVP voting table not found for {ending_year}. "
+            f"Saved HTML to {debug_path} for inspection."
+        )
 
-    # Common columns include: Rank, Player, Age, Tm, First, Pts Won, Pts Max, Share, etc.
-    # Normalize
-    rename = {}
-    for c in df.columns:
-        lc = str(c).strip().lower()
-        if lc in {"rk", "rank"}:
-            rename[c] = "rank"
-        elif lc == "player":
-            rename[c] = "player"
-        elif lc in {"tm", "team"}:
-            rename[c] = "team"
-        elif lc == "share":
-            rename[c] = "vote_share"
-    df = df.rename(columns=rename)
+    # --------------------------------------------------
+    # 2) FLATTEN + NORMALIZE COLUMNS (THIS FIXES 2010)
+    # --------------------------------------------------
+    mvp = flatten_columns(mvp)
 
-    keep = [c for c in ["rank", "player", "team", "vote_share"] if c in df.columns]
-    df = df[keep].copy()
-    df["season"] = season_label
+    # --------------------------------------------------
+    # 3) VALIDATION + FEATURE CREATION
+    # --------------------------------------------------
+    if "player" not in mvp.columns:
+        if "name" in mvp.columns:
+            mvp = mvp.rename(columns={"name": "player"})
+        else:
+            raise RuntimeError(f"Player column not found for {ending_year}: {mvp.columns.tolist()}")
 
-    # Coerce types
-    if "rank" in df.columns:
-        df["rank"] = pd.to_numeric(df["rank"], errors="coerce").astype("Int64")
-    if "vote_share" in df.columns:
-        df["vote_share"] = pd.to_numeric(df["vote_share"], errors="coerce")
+    if "share" not in mvp.columns:
+        raise RuntimeError(f"'share' column not found for {ending_year}: {mvp.columns.tolist()}")
 
-    df = df.dropna(subset=["player"])
-    return df
+    mvp = mvp[["player", "share"]].rename(columns={"share": "vote_share"})
+    mvp["vote_share"] = pd.to_numeric(mvp["vote_share"], errors="coerce")
+    mvp = mvp.dropna(subset=["vote_share"])
+    mvp["player"] = clean_player_names(mvp["player"])
+    mvp["season"] = season_str(ending_year)
+    mvp["rank"] = mvp["vote_share"].rank(ascending=False, method="min").astype(int)
+    mvp["is_winner"] = (mvp["rank"] == 1).astype(int)
 
-def scrape_mvp_voting(start_season_end_year: int = 1980, end_season_end_year: int = 2025) -> pd.DataFrame:
-    rows = []
-    for yr in range(start_season_end_year, end_season_end_year + 1):
-        season_label = f"{yr-1}-{str(yr)[-2:]}"
-        url = _season_url(yr)
-        r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        df = _parse_mvp_table(r.text, season_label)
-        rows.append(df)
+    return mvp[["season", "player", "vote_share", "rank", "is_winner"]]
 
-    out = pd.concat(rows, ignore_index=True)
-    return out
 
 def main() -> None:
-    out_path = RAW_DIR / "mvp_voting.csv"
-    df = scrape_mvp_voting()
-    write_csv(df, out_path)
-    print(f"Wrote {len(df):,} rows -> {out_path}")
+    p = argparse.ArgumentParser(description="Scrape MVP voting from Basketball-Reference.")
+    p.add_argument("--start", type=int, default=2010, help="first season ending year")
+    p.add_argument("--end", type=int, default=2025, help="last season ending year")
+    args = p.parse_args()
+
+    all_rows = []
+    for y in range(args.start, args.end + 1):
+        print(f"Scraping MVP voting for {season_str(y)}...")
+        all_rows.append(scrape_mvp_voting(y))
+
+    out = pd.concat(all_rows, ignore_index=True)
+    write_csv(out, OUT_PATH)
+    print(
+        f"Wrote {OUT_PATH} with {len(out):,} rows across "
+        f"{out['season'].nunique()} seasons."
+    )
+
 
 if __name__ == "__main__":
     main()
